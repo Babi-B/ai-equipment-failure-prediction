@@ -1,84 +1,81 @@
 import os
 import tensorflow as tf
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from utils.preprocess import load_nasa_data, add_rul, create_sequences, create_tabular_features
+from xgboost import XGBRegressor
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.model_selection import GroupShuffleSplit
+from utils.preprocess import load_nasa_data, handle_missing_data, add_rul, create_sequences, create_tabular_features
 import joblib
 
 # Load and preprocess data
-train_df = load_nasa_data('data/train_FD001.txt')
+train_files = [f'data/train_FD00{i}.txt' for i in range(1,5)]
+train_df = load_nasa_data(train_files)
+train_df = handle_missing_data(train_df)
 train_df = add_rul(train_df)
 
-# Normalize sensor data
-scaler = MinMaxScaler()
+# Advanced conditional normalization
 sensor_cols = [col for col in train_df.columns if 'sensor' in col]
-train_df[sensor_cols] = scaler.fit_transform(train_df[sensor_cols])
+scaler_dict = {}
+for condition in train_df['operating_condition'].unique():
+    condition_mask = train_df['operating_condition'] == condition
+    scaler = MinMaxScaler()
+    train_df.loc[condition_mask, sensor_cols] = scaler.fit_transform(train_df.loc[condition_mask, sensor_cols])
+    scaler_dict[condition] = scaler
 
-# Create sequences for LSTM
+# Feature engineering
 window_size = 30
-X_sequences, y = create_sequences(train_df, window_size=window_size)
+X_seq, y = create_sequences(train_df, window_size)
+X_tab = create_tabular_features(train_df, window_size)
 
-# Create tabular features FOR EACH SEQUENCE WINDOW (not per engine)
-tabular_features = create_tabular_features(train_df, window_size=window_size)
+# Encode categorical features
+le = LabelEncoder()
+X_tab['fault_mode'] = le.fit_transform(X_tab['fault_mode'])
 
-# Split data into train/val using sklearn to preserve alignment
-X_train_seq, X_val_seq, X_train_tab, X_val_tab, y_train, y_val = train_test_split(
-    X_sequences, tabular_features, y, test_size=0.2, random_state=42
-)
+# Temporal-aware train-test split
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, val_idx = next(gss.split(X_seq, groups=train_df['engine_id'].iloc[:len(X_seq)]))
 
-# Build LSTM-only baseline
-lstm_model = tf.keras.models.Sequential([
-    tf.keras.layers.LSTM(64, input_shape=(X_train_seq.shape[1], X_train_seq.shape[2])),
-    tf.keras.layers.Dense(32, activation='relu'),
-    tf.keras.layers.Dense(1)
-])
-lstm_model.compile(optimizer='adam', loss='mae')
-lstm_model.fit(X_train_seq, y_train, epochs=50, validation_data=(X_val_seq, y_val))
+# Hybrid Model Architecture (LSTM + XGBoost enhanced)
+lstm_input = tf.keras.Input(shape=(window_size, X_seq.shape[2]))
+x = tf.keras.layers.LSTM(128, return_sequences=True)(lstm_input)
+x = tf.keras.layers.Attention()([x, x])
+x = tf.keras.layers.GlobalAvgPool1D()(x)
 
-# Build hybrid model
-lstm_input = tf.keras.layers.Input(shape=(X_train_seq.shape[1], X_train_seq.shape[2]))
-tabular_input = tf.keras.layers.Input(shape=(X_train_tab.shape[1],))
+tabular_input = tf.keras.Input(shape=(X_tab.shape[1],))
+y = tf.keras.layers.Dense(64, activation='relu')(tabular_input)
 
-# LSTM branch
-x = tf.keras.layers.LSTM(64)(lstm_input)
-
-# Tabular branch (processed features)
-y = tf.keras.layers.Dense(32)(tabular_input)
-
-# Combine branches
 combined = tf.keras.layers.Concatenate()([x, y])
-output = tf.keras.layers.Dense(1)(combined)
+output = tf.keras.layers.Dense(1, activation='relu')(combined)
 
-hybrid_model = tf.keras.models.Model(inputs=[lstm_input, tabular_input], outputs=output)
-hybrid_model.compile(optimizer='adam', loss='mae')
+model = tf.keras.Model(inputs=[lstm_input, tabular_input], outputs=output)
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss='mae',
+              metrics=['mae', tf.keras.metrics.RootMeanSquaredError()])
 
 # Train hybrid model
-hybrid_model.fit(
-    [X_train_seq, X_train_tab],
-    y_train,
+history = model.fit(
+    [X_seq[train_idx], X_tab.iloc[train_idx]],
+    y[train_idx],
+    validation_data=([X_seq[val_idx], X_tab.iloc[val_idx]], y[val_idx]),
     epochs=50,
-    validation_data=([X_val_seq, X_val_tab], y_val)
+    batch_size=256,
+    callbacks=[tf.keras.callbacks.EarlyStopping(patience=5)]
 )
 
-# Build LSTM-only baseline
-lstm_model = tf.keras.models.Sequential([
-    tf.keras.layers.LSTM(64, input_shape=(X_train_seq.shape[1], X_train_seq.shape[2])),
-    tf.keras.layers.Dense(32, activation='relu'),
-    tf.keras.layers.Dense(1)
-])
-# lstm_model.compile(optimizer='adam', loss='mae')
-# Build and compile the model
-lstm_model.compile(
-    optimizer='adam',
-    loss=tf.keras.losses.MeanAbsoluteError(),  # Explicit class or 'mean_absolute_error'
-    metrics=['mae']  # Metrics can still use shorthand
+# Train XGBoost ensemble
+xgb_model = XGBRegressor(
+    n_estimators=500,
+    max_depth=7,
+    learning_rate=0.01,
+    subsample=0.8,
+    colsample_bytree=0.9,
+    tree_method='hist',
+    enable_categorical=True
 )
-lstm_model.fit(X_train_seq, y_train, epochs=50, validation_data=(X_val_seq, y_val))
+xgb_model.fit(X_tab.iloc[train_idx], y[train_idx])
 
-# ADD THIS LINE TO CREATE THE DIRECTORY
+# Save models
 os.makedirs('models', exist_ok=True)
-
-# Save model
-lstm_model.save('models/lstm_baseline.h5')  # <-- Now the directory exists!
-joblib.dump(scaler, "models/scaler.pkl")
+model.save('models/hybrid_model.keras')
+joblib.dump(xgb_model, 'models/xgboost_model.pkl')
+joblib.dump(scaler_dict, 'models/scaler_dict.pkl')
+joblib.dump(le, 'models/label_encoder.pkl')
