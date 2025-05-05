@@ -1,11 +1,9 @@
 import streamlit as st
 import tensorflow as tf
 import joblib
-import pandas as pd
 import plotly.express as px
 from utils.preprocess import load_nasa_data, handle_missing_data, create_sequences, create_tabular_features
 import os
-import numpy as np
 
 # Set page config must be FIRST command
 st.set_page_config(page_title="AI Equipment Health Monitor", layout="wide")
