@@ -1,0 +1,16 @@
+# Python virtual environment
+.venv/
+env/
+venv/
+
+# IDEs and caches
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# # Optional: dataset or model caches
+# *.h5
+# *.pkl
+# *.csv
